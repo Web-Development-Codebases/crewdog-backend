@@ -11,8 +11,8 @@ videoApi.get("/", (req, res) => {
 
 // Get token
 videoApi.get("/get-token", (req, res) => {
-  const API_KEY = "https://api.videosdk.live/v2";
-  const SECRET_KEY = "a1af4eb1af094fc85316785d641d18c4e3dd597b1ec6cecc4a76f03c4d29a713";
+  const API_KEY = "89132909-c10f-478c-99f5-c9dfc3aa7159";
+  const SECRET_KEY = "a3ea6c5fd1fb0fe4d50b07117c98f5d4471738373b16cc2643e46ad03f1ee592";
 
   const options = { expiresIn: "10m", algorithm: "HS256" };
 
@@ -46,7 +46,7 @@ videoApi.post("/validate-meeting/:meetingId", (req, res) => {
   const token = req.body.token;
   const meetingId = req.params.meetingId;
 
-  const url = `${process.env.VIDEOSDK_API_ENDPOINT}/api/meetings/${meetingId}`;
+  const url = `https://api.videosdk.live/v2/api/meetings/${meetingId}`;
 
   const options = {
     method: "POST",
