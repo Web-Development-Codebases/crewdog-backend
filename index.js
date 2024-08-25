@@ -2,239 +2,174 @@ const express = require('express');
 const multer = require('multer');
 const { spawn } = require('child_process');
 const path = require('path');
-const fs = require('fs');
+const fs = require('fs').promises;
 const cors = require('cors');
 const morgan = require('morgan');
+const AWS = require('aws-sdk');
+const dotenv = require('dotenv');
+const { v4: uuidv4 } = require('uuid');
+const { promisify } = require('util');
+const exec = promisify(require('child_process').exec);
 const videoApi = require('./videosdk');
 const agoraSdk = require('./agorasdk');
 
+dotenv.config();
+
 const app = express();
-const upload = multer({ dest: 'temp_videos/' });
+const upload = multer({ dest: 'temp_uploads/' });
 const port = 3000;
 
-app.use(cors()); // Enable CORS for all routes
+AWS.config.update({
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    region: process.env.AWS_REGION
+});
+
+const s3 = new AWS.S3();
+const BUCKET_NAME = process.env.S3_BUCKET_NAME;
+
+app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan('dev'));
-app.use(express.static('watermarked_videos'));
 
-// Middleware to handle request timeout
-const requestTimeout = 360000; // 6 minutes in milliseconds
+const requestTimeout = 360000;
 app.use((req, res, next) => {
     req.setTimeout(requestTimeout, () => {
         const error = new Error('Request Timeout');
-        error.status = 408; // Request Timeout
+        error.status = 408;
         next(error);
     });
     next();
 });
 
-// Existing /add_watermark route
-app.post('/add_watermark', upload.single('file'), (req, res) => {
+async function getVideoHeight(filePath) {
+    try {
+        const { stdout } = await exec(`ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=height -of csv=p=0 "${filePath}"`);
+        return parseInt(stdout.trim());
+    } catch (error) {
+        console.error('Error executing ffprobe:', error);
+        throw new Error('Failed to get video dimensions');
+    }
+}
+
+async function scaleWatermark(watermarkImagePath, watermarkScaledPath, watermarkScale) {
+    return new Promise((resolve, reject) => {
+        const ffmpegPath = 'ffmpeg';
+        const ffmpegScaleProcess = spawn(ffmpegPath, [
+            '-i', watermarkImagePath,
+            '-vf', `scale=-1:${watermarkScale}`,
+            watermarkScaledPath,
+        ]);
+
+        let ffmpegOutput = '';
+        ffmpegScaleProcess.stderr.on('data', (data) => {
+            ffmpegOutput += data.toString();
+        });
+
+        ffmpegScaleProcess.on('exit', (code) => {
+            if (code === 0) {
+                resolve();
+            } else {
+                console.error('FFmpeg output:', ffmpegOutput);
+                reject(new Error(`Failed to scale the watermark image. FFmpeg process exited with code: ${code}`));
+            }
+        });
+    });
+}
+
+async function addWatermarkToVideo(inputPath, watermarkPath, outputPath) {
+    return new Promise((resolve, reject) => {
+        const ffmpegPath = 'ffmpeg';
+        const ffmpegProcess = spawn(ffmpegPath, [
+            '-i', inputPath,
+            '-i', watermarkPath,
+            '-filter_complex', `[0:v][1:v]overlay=W-w-10:10:enable='between(t,0,1000000)'`,
+            '-b:v', '500k',
+            '-codec:a', 'copy',
+            outputPath,
+        ]);
+
+        let ffmpegOutput = '';
+        ffmpegProcess.stderr.on('data', (data) => {
+            ffmpegOutput += data.toString();
+        });
+
+        ffmpegProcess.on('exit', (code) => {
+            if (code === 0) {
+                resolve();
+            } else {
+                console.error('FFmpeg output:', ffmpegOutput);
+                reject(new Error(`Failed to add watermark to video. FFmpeg process exited with code: ${code}`));
+            }
+        });
+    });
+}
+
+async function uploadToS3(filePath, fileName) {
+    const fileContent = await fs.readFile(filePath);
+    const params = {
+        Bucket: BUCKET_NAME,
+        Key: fileName,
+        Body: fileContent
+    };
+
+    try {
+        const data = await s3.upload(params).promise();
+        return data.Location;
+    } catch (err) {
+        console.error("Error uploading to S3:", err);
+        throw err;
+    }
+}
+
+async function processVideo(req, res, watermarkType) {
     if (!req.file) {
         return res.status(400).send('No file provided');
     }
 
+    const uniqueId = uuidv4();
     const uploadedFilePath = req.file.path;
-    const watermarkImagePath = 'watermark.png';
-    const watermarkScaledPath = 'watermark_scaled.png';
-    const watermarkedFilePath = `watermarked_videos/${req.file.originalname.replace(/\.[^/.]+$/, '')}_watermarked.mp4`;
+    const watermarkImagePath = path.join(__dirname, `${watermarkType}-watermark.png`);
+    const watermarkScaledPath = path.join(__dirname, `temp_watermarks/watermark_scaled_${uniqueId}.png`);
+    const watermarkedFilePath = path.join(__dirname, `temp_watermarked/${uniqueId}_watermarked_${watermarkType}.mp4`);
 
-    // Delete the old watermarked video if it exists
-    fs.unlink(watermarkedFilePath, (err) => {
-        if (err && err.code !== 'ENOENT') {
-            console.error('Error deleting old watermarked video:', err);
+    try {
+        await fs.access(watermarkImagePath);
+
+        const videoHeight = await getVideoHeight(uploadedFilePath);
+        const watermarkScale = Math.floor(videoHeight * 0.1);
+
+        await fs.mkdir(path.dirname(watermarkScaledPath), { recursive: true });
+        await fs.mkdir(path.dirname(watermarkedFilePath), { recursive: true });
+
+        await scaleWatermark(watermarkImagePath, watermarkScaledPath, watermarkScale);
+        await addWatermarkToVideo(uploadedFilePath, watermarkScaledPath, watermarkedFilePath);
+
+        const s3Url = await uploadToS3(watermarkedFilePath, `${uniqueId}_watermarked_${watermarkType}.mp4`);
+
+        res.json({ url: s3Url });
+
+    } catch (error) {
+        console.error('Error processing video:', error);
+        res.status(500).send(`Failed to process video: ${error.message}`);
+    } finally {
+        try {
+            await fs.unlink(uploadedFilePath);
+            await fs.unlink(watermarkScaledPath);
+            await fs.unlink(watermarkedFilePath);
+        } catch (error) {
+            console.error('Error cleaning up temporary files:', error);
         }
+    }
+}
 
-        // Scale the watermark image to 50% of the video height
-        const ffprobePath = 'ffprobe'; // Path to the ffprobe executable
-        const ffprobeProcess = spawn(ffprobePath, [
-            '-v',
-            'error',
-            '-select_streams',
-            'v:0',
-            '-show_entries',
-            'stream=height',
-            '-of',
-            'csv=s=x:p=0',
-            uploadedFilePath,
-        ]);
-
-        ffprobeProcess.stdout.on('data', (data) => {
-            const videoHeight = parseInt(data.toString().trim());
-
-            const watermarkScale = Math.floor(videoHeight * 0.1); // Adjust the scale factor as desired
-
-            const ffmpegPath = 'ffmpeg'; // Path to the ffmpeg executable
-            const ffmpegScaleProcess = spawn(ffmpegPath, [
-                '-i', watermarkImagePath,
-                '-vf', `scale=-1:${watermarkScale}`,
-                watermarkScaledPath,
-            ]);
-
-            ffmpegScaleProcess.on('exit', (code) => {
-                if (code === 0) {
-                    // Continue with the watermarking process
-                    const ffmpegProcess = spawn(ffmpegPath, [
-                        '-i', uploadedFilePath,
-                        '-i', watermarkScaledPath,
-                        '-filter_complex', `[0:v][1:v]overlay=W-w-10:10:enable='between(t,0,1000000)'`,
-                        '-b:v', '500k',
-                        '-codec:a', 'copy',
-                        watermarkedFilePath,
-                    ]);
-
-                    ffmpegProcess.on('exit', (code) => {
-                        if (code === 0) {
-                            res.download(watermarkedFilePath, (err) => {
-                                if (err) {
-                                    console.error('Error sending watermarked video:', err);
-                                }
-
-                                // Delete the uploaded file
-                                fs.unlink(uploadedFilePath, (err) => {
-                                    if (err) {
-                                        console.error('Error deleting uploaded file:', err);
-                                    }
-                                });
-
-                                // Delete the old watermarked video if it exists
-                                fs.unlink(watermarkedFilePath, (err) => {
-                                    if (err && err.code !== 'ENOENT') {
-                                        console.error('Error deleting old watermarked video:', err);
-                                    }
-                                });
-                            });
-                        } else {
-                            console.error('Failed to add watermark to video. ffmpeg process exited with code:', code);
-                            res.status(500).send('Failed to add watermark to video. Please try again.');
-                        }
-
-                        // Delete the scaled watermark image
-                        fs.unlink(watermarkScaledPath, (err) => {
-                            if (err) {
-                                console.error('Error deleting scaled watermark image:', err);
-                            }
-                        });
-                    });
-                } else {
-                    console.error('Failed to scale the watermark image. ffmpeg process exited with code:', code);
-                    res.status(500).send('Failed to add watermark to video. Please try again.');
-                }
-            });
-        });
-
-        ffprobeProcess.on('exit', (code) => {
-            if (code !== 0) {
-                console.error('Failed to get video dimensions. ffprobe process exited with code:', code);
-                res.status(500).send('Failed to add watermark to video. Please try again.');
-            }
-        });
-    });
+app.post('/add_watermark', upload.single('file'), (req, res) => {
+    processVideo(req, res, 'default');
 });
 
-// Existing /add_watermark_crewdog route
 app.post('/add_watermark_crewdog', upload.single('file'), (req, res) => {
-    if (!req.file) {
-        return res.status(400).send('No file provided');
-    }
-
-    const uploadedFilePath = req.file.path;
-    const watermarkImagePath = 'crewdog-watermark.png';
-    const watermarkScaledPath = 'watermark_scaled.png';
-    const watermarkedFilePath = `watermarked_videos/${req.file.originalname.replace(/\.[^/.]+$/, '')}_watermarked.mp4`;
-
-    // Delete the old watermarked video if it exists
-    fs.unlink(watermarkedFilePath, (err) => {
-        if (err && err.code !== 'ENOENT') {
-            console.error('Error deleting old watermarked video:', err);
-        }
-
-        // Scale the watermark image to 50% of the video height
-        const ffprobePath = 'ffprobe'; // Path to the ffprobe executable
-        const ffprobeProcess = spawn(ffprobePath, [
-            '-v',
-            'error',
-            '-select_streams',
-            'v:0',
-            '-show_entries',
-            'stream=height',
-            '-of',
-            'csv=s=x:p=0',
-            uploadedFilePath,
-        ]);
-
-        ffprobeProcess.stdout.on('data', (data) => {
-            const videoHeight = parseInt(data.toString().trim());
-
-            const watermarkScale = Math.floor(videoHeight * 0.1); // Adjust the scale factor as desired
-
-            const ffmpegPath = 'ffmpeg'; // Path to the ffmpeg executable
-            const ffmpegScaleProcess = spawn(ffmpegPath, [
-                '-i', watermarkImagePath,
-                '-vf', `scale=-1:${watermarkScale}`,
-                watermarkScaledPath,
-            ]);
-
-            ffmpegScaleProcess.on('exit', (code) => {
-                if (code === 0) {
-                    // Continue with the watermarking process
-                    const ffmpegProcess = spawn(ffmpegPath, [
-                        '-i', uploadedFilePath,
-                        '-i', watermarkScaledPath,
-                        '-filter_complex', `[0:v][1:v]overlay=W-w-10:10:enable='between(t,0,1000000)'`,
-                        '-b:v', '500k',
-                        '-codec:a', 'copy',
-                        watermarkedFilePath,
-                    ]);
-
-                    ffmpegProcess.on('exit', (code) => {
-                        if (code === 0) {
-                            res.download(watermarkedFilePath, (err) => {
-                                if (err) {
-                                    console.error('Error sending watermarked video:', err);
-                                }
-
-                                // Delete the uploaded file
-                                fs.unlink(uploadedFilePath, (err) => {
-                                    if (err) {
-                                        console.error('Error deleting uploaded file:', err);
-                                    }
-                                });
-
-                                // Delete the old watermarked video if it exists
-                                fs.unlink(watermarkedFilePath, (err) => {
-                                    if (err && err.code !== 'ENOENT') {
-                                        console.error('Error deleting old watermarked video:', err);
-                                    }
-                                });
-                            });
-                        } else {
-                            console.error('Failed to add watermark to video. ffmpeg process exited with code:', code);
-                            res.status(500).send('Failed to add watermark to video. Please try again.');
-                        }
-
-                        // Delete the scaled watermark image
-                        fs.unlink(watermarkScaledPath, (err) => {
-                            if (err) {
-                                console.error('Error deleting scaled watermark image:', err);
-                            }
-                        });
-                    });
-                } else {
-                    console.error('Failed to scale the watermark image. ffmpeg process exited with code:', code);
-                    res.status(500).send('Failed to add watermark to video. Please try again.');
-                }
-            });
-        });
-
-        ffprobeProcess.on('exit', (code) => {
-            if (code !== 0) {
-                console.error('Failed to get video dimensions. ffprobe process exited with code:', code);
-                res.status(500).send('Failed to add watermark to video. Please try again.');
-            }
-        });
-    });
+    processVideo(req, res, 'crewdog');
 });
 
 app.use('/videosdk', videoApi);
@@ -243,3 +178,4 @@ app.use('/agorasdk', agoraSdk);
 app.listen(port, () => {
     console.log(`API listening at http://localhost:${port}`);
 });
+
