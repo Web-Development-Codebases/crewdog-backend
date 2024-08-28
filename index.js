@@ -12,6 +12,7 @@ const { promisify } = require('util');
 const exec = promisify(require('child_process').exec);
 const videoApi = require('./videosdk');
 const agoraSdk = require('./agorasdk');
+const imageApi = require('./imageApi')
 
 dotenv.config();
 
@@ -174,6 +175,7 @@ app.post('/add_watermark_crewdog', upload.single('file'), (req, res) => {
 
 app.use('/videosdk', videoApi);
 app.use('/agorasdk', agoraSdk);
+app.use('/imageapi', imageApi);
 
 app.listen(port, () => {
     console.log(`API listening at http://localhost:${port}`);
